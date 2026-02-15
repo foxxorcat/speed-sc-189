@@ -1,31 +1,39 @@
 #!/bin/bash
 # =================================================================
 # 189电信宽带测速工具 (Shell版)
-# Version: 1.2.0
-# Description: 
+# Version: 1.3.0
+# Description:
 # =================================================================
 
-# 全局配置
+# --- 全局配置 ---
 THREADS=8
 DURATION=10
-MODE="all" # all, down, up
-IP_FLAG="" # 空(auto), -4, -6
+MODE="all" # 模式: all(全测), down(仅下载), up(仅上传)
+IP_FLAG="" # 协议栈标志: 空(自动), -4(IPv4), -6(IPv6)
 SELECT_NODES=false
 BASE_URL="https://speed.sc.189.cn/user_interface/users"
 USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 REFERER="https://speed.sc.189.cn/"
 
-# 全局变量
-SESSION_TOKEN=""
-ONLINE_IP="" # 存储鉴权时获取的IP
+# 新增全局 CURL 参数控制
+# -k: 跳过SSL验证 (Insecure)
+# -s: 静默模式 (Silent)
+# --connect-timeout: 连接超时设为 3 秒
+CURL_FLAGS="-k -s --connect-timeout 3"
 
-# 颜色定义
+# --- 运行时变量 ---
+SESSION_TOKEN=""
+WORKDIR="/tmp/speedtest_189_$$"
+TOKEN_VAL="aaa" # 默认Token，后续尝试动态更新
+
+# --- 终端颜色定义 ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
+# --- 日志输出 ---
 log() {
     echo -e "${2}${1}${NC}"
 }
@@ -43,12 +51,36 @@ usage() {
     echo "  --duration [秒]        测速时长 (默认: 10)"
     echo "  --threads [数量]       并发线程数 (默认: 8)"
     echo "  --ip [auto|ipv4|ipv6]  强制协议栈"
-    echo "  --select               交互式手动选择节点 (仅test有效)"
+    echo "  --select               手动选择节点 (仅test有效)"
     echo "  --help                 显示帮助"
     exit 1
 }
 
-# --- 参数解析逻辑 ---
+# --- 资源清理与信号处理 ---
+cleanup_files() {
+    # 仅清理当前进程的临时目录
+    if [[ -d "$WORKDIR" ]]; then
+        rm -rf "$WORKDIR"
+    fi
+}
+
+handle_sigint() {
+    trap '' SIGINT SIGTERM
+    echo ""
+    log "用户中断操作，正在终止进程并清理资源..." "$RED"
+    local pids=$(jobs -p)
+    if [ -n "$pids" ]; then
+        kill -TERM $pids 2>/dev/null
+        wait $pids 2>/dev/null
+    fi
+    cleanup_files
+    exit 130
+}
+
+trap handle_sigint SIGINT SIGTERM
+trap cleanup_files EXIT
+
+# --- 参数解析 ---
 COMMAND="test"
 if [[ "$1" == "info" || "$1" == "nodes" || "$1" == "test" ]]; then
     COMMAND="$1"
@@ -58,12 +90,18 @@ fi
 while [[ $# -gt 0 ]]; do
     key="$1"
     case $key in
+        -4) IP_FLAG="-4"; shift ;;
+        -6) IP_FLAG="-6"; shift ;;
         --mode) MODE="$2"; shift; shift ;;
         --duration) DURATION="$2"; shift; shift ;;
         --threads) THREADS="$2"; shift; shift ;;
         --ip)
-            if [[ "$2" == "ipv4" ]]; then IP_FLAG="-4"; fi
-            if [[ "$2" == "ipv6" ]]; then IP_FLAG="-6"; fi
+            # 兼容旧的长参数格式
+            case "$2" in
+                ipv4|4|-4) IP_FLAG="-4" ;;
+                ipv6|6|-6) IP_FLAG="-6" ;;
+                *) echo "错误: --ip 参数无效，请使用 ipv4/4 或 ipv6/6"; usage ;;
+            esac
             shift; shift ;;
         --select) SELECT_NODES=true; shift ;;
         --help) usage ;;
@@ -71,263 +109,304 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# 检查依赖
+# --- 依赖检查 ---
 check_deps() {
-    for cmd in curl awk grep sed sort head cut; do
+    for cmd in curl awk grep sed sort head cut tr rm cat mkdir kill date; do
         if ! command -v $cmd &> /dev/null; then
-            log "错误: 未找到必要命令 '$cmd'，请先安装。" "$RED"
+            log "错误: 系统缺少必要命令 '$cmd'，请先安装。" "$RED"
             exit 1
         fi
     done
+    mkdir -p "$WORKDIR" || { log "错误: 无法创建临时目录 $WORKDIR" "$RED"; exit 1; }
 }
 
-# --- JSON 提取工具函数 ---
+# --- JSON 解析工具 ---
 get_json_value() {
     local json="$1"
     local key="$2"
-    # 使用 awk 以 "key": 为分隔符，兼容空格
-    # 示例: "ip" : "1.2.3.4" -> 分割后取第二部分，再以双引号分割取值
-    echo "$json" | awk -F"\"$key\"[[:space:]]*:[[:space:]]*\"" '{print $2}' | awk -F"\"" '{print $1}'
+    echo "$json" | tr -d '\n\r' | sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
 }
 
 get_json_number() {
     local json="$1"
     local key="$2"
-    # 提取数字，处理结尾的逗号或大括号
-    echo "$json" | awk -F"\"$key\"[[:space:]]*:[[:space:]]*" '{print $2}' | awk -F"[,}]" '{print $1}' | tr -d ' '
+    echo "$json" | tr -d '\n\r' | sed -n 's/.*"'"$key"'"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p'
 }
 
-# 旋转动画
+# --- 核心功能函数 ---
+
+# 进度指示器
 spinner() {
     local pid=$1
-    local delay=0.1
     local spinstr='|/-\'
-    while [ "$(ps a | awk '{print $1}' | grep $pid)" ]; do
+    while kill -0 "$pid" 2>/dev/null; do
         local temp=${spinstr#?}
         printf " [%c]  " "$spinstr"
         local spinstr=$temp${spinstr%"$temp"}
-        sleep $delay
+        # 兼容 OpenWrt BusyBox，sleep 参数取整数
+        sleep 1
         printf "\b\b\b\b\b\b"
     done
     printf "    \b\b\b\b"
 }
 
-# 1. 鉴权
+# 用户鉴权
 authenticate() {
     if [[ "$COMMAND" == "test" ]]; then log "正在进行鉴权..." "$CYAN"; fi
     
-    local resp=$(curl -s $IP_FLAG -H "User-Agent: $USER_AGENT" "$BASE_URL/getOnlineIP" --connect-timeout 5)
+    # 使用全局 CURL_FLAGS
+    local resp=$(curl $IP_FLAG $CURL_FLAGS -H "User-Agent: $USER_AGENT" "$BASE_URL/getOnlineIP")
     SESSION_TOKEN=$(get_json_value "$resp" "token")
-    ONLINE_IP=$(get_json_value "$resp" "ip") # 尝试在此处获取 IP
     
     if [ -n "$SESSION_TOKEN" ]; then
         if [[ "$COMMAND" == "test" ]]; then log "鉴权成功." "$GREEN"; fi
         return 0
     else
-        log "鉴权失败，服务器响应: $resp" "$RED"
+        log "鉴权失败 (响应: $resp)" "$RED"
         return 1
     fi
 }
 
-# 2. 获取并显示用户信息
+# 获取用户信息
 get_user_info() {
-    if [[ "$COMMAND" == "test" ]]; then log "获取用户信息..." "$CYAN"; fi
-    
-    local resp=$(curl -s $IP_FLAG -H "User-Agent: $USER_AGENT" -H "Authorization: $SESSION_TOKEN" "$BASE_URL/getUserInfoByOnlineIP")
-    
-    local userNo=$(get_json_value "$resp" "userNo")
-    local downBand=$(get_json_number "$resp" "aaaDownBand")
-    local upBand=$(get_json_number "$resp" "aaaUpBand")
-    
-    # 1. 优先使用 authenticate 阶段从 getOnlineIP 获取到的 IP
-    local my_ip="$ONLINE_IP"
-    
-    # 2. 如果为空，尝试请求 ip 接口
-    if [ -z "$my_ip" ]; then
-        # 尝试 IPv4
-        local ip_resp=$(curl -s $IP_FLAG -H "User-Agent: $USER_AGENT" https://speedtp3.sc.189.cn:8299/ip/ipv4 --connect-timeout 2)
-        # 尝试解析 JSON key "IP" (注意大小写)
-        my_ip=$(get_json_value "$ip_resp" "IP")
-        
-        # 如果解析失败，检查是否为纯文本 IP
-        if [ -z "$my_ip" ] && [[ -n "$ip_resp" ]]; then
-             # 简单过滤，防止输出 HTML 错误页
-             if [[ "$ip_resp" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                my_ip=$(echo "$ip_resp" | tr -d ' \n\r')
-             fi
-        fi
-        
-        # 尝试 IPv6
-        if [ -z "$my_ip" ]; then
-            ip_resp=$(curl -s $IP_FLAG -H "User-Agent: $USER_AGENT" https://speedtp3.sc.189.cn:8299/ip/ipv6 --connect-timeout 2)
-            my_ip=$(get_json_value "$ip_resp" "IP")
-            if [ -z "$my_ip" ] && [[ -n "$ip_resp" ]]; then
-                 if [[ "$ip_resp" =~ : ]]; then
-                    my_ip=$(echo "$ip_resp" | tr -d ' \n\r')
-                 fi
-            fi
-        fi
-    fi
-    
-    if [[ -z "$downBand" ]]; then downBand=0; fi
-    if [[ -z "$upBand" ]]; then upBand=0; fi
+    local max_retries=3
+    local attempt=1
+    local success=false
 
-    local down_mbps=$(awk "BEGIN {printf \"%.0f\", $downBand/1024}")
-    local up_mbps=$(awk "BEGIN {printf \"%.0f\", $upBand/1024}")
-    
-    echo "--------------------------------"
-    echo -e "用户账号: ${GREEN}$userNo${NC}"
-    echo -e "当前 IP : ${GREEN}$my_ip${NC}"
-    echo -e "签约带宽: 下行 ${YELLOW}${down_mbps}M${NC} / 上行 ${YELLOW}${up_mbps}M${NC}"
-    echo "--------------------------------"
+    if [[ "$COMMAND" == "test" ]]; then log "获取用户信息..." "$CYAN"; fi
+
+    while [ $attempt -le $max_retries ]; do
+        local resp=$(curl $IP_FLAG $CURL_FLAGS -H "User-Agent: $USER_AGENT" -H "Authorization: $SESSION_TOKEN" "$BASE_URL/getUserInfoByOnlineIP")
+        local userNo=$(get_json_value "$resp" "userNo")
+        
+        if [[ -n "$userNo" ]]; then
+            local downBand=$(get_json_number "$resp" "aaaDownBand")
+            local upBand=$(get_json_number "$resp" "aaaUpBand")
+            
+            if [[ -z "$downBand" ]]; then downBand=0; fi
+            if [[ -z "$upBand" ]]; then upBand=0; fi
+            local down_mbps=$(awk "BEGIN {printf \"%.0f\", $downBand/1024}")
+            local up_mbps=$(awk "BEGIN {printf \"%.0f\", $upBand/1024}")
+            
+            # 获取当前 IP (不进行复杂探测，仅用于显示)
+            local current_ip="N/A"
+            local ip_probe_url="https://speedtp3.sc.189.cn:8299/ip/ipv4"
+            if [[ "$IP_FLAG" == "-6" ]]; then
+                ip_probe_url="https://speedtp3.sc.189.cn:8299/ip/ipv6"
+            fi
+            
+            local raw_ip_resp=$(curl $IP_FLAG $CURL_FLAGS --max-time 2 "$ip_probe_url" 2>/dev/null)
+            
+            # 1. 尝试作为 JSON 提取 "IP" 字段 (针对 {"result":true,"IP":"..."} 格式)
+            local extracted_ip=$(get_json_value "$raw_ip_resp" "IP")
+            
+            if [ -n "$extracted_ip" ]; then
+                current_ip="$extracted_ip"
+            else
+                # 2. 如果 JSON 提取失败，尝试正则提取纯 IP (兜底纯文本响应)
+                if [[ "$IP_FLAG" == "-6" ]]; then
+                    current_ip=$(echo "$raw_ip_resp" | grep -oE "([a-fA-F0-9]{1,4}:){1,7}[a-fA-F0-9]{1,4}" | head -n1)
+                else
+                    current_ip=$(echo "$raw_ip_resp" | grep -oE "[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}" | head -n1)
+                fi
+            fi
+
+            echo "--------------------------------"
+            echo -e "用户账号: ${GREEN}${userNo}${NC}"
+            echo -e "当前 IP : ${GREEN}${current_ip:-未知}${NC}"
+            echo -e "签约带宽: 下行 ${YELLOW}${down_mbps}M${NC} / 上行 ${YELLOW}${up_mbps}M${NC}"
+            echo "--------------------------------"
+            success=true
+            break
+        else
+            log "获取信息失败，正在重试 ($attempt/$max_retries)..." "$YELLOW"
+            ((attempt++))
+            sleep 1
+        fi
+    done
+
+    if [ "$success" = false ]; then
+        log "警告: 无法获取完整用户信息，将尝试继续测速。" "$YELLOW"
+    fi
 }
 
-# 3. 探测节点
+# 探测测速节点 (统一逻辑)
 probe_nodes() {
     log "正在探测测速节点..." "$CYAN"
     
-    local resp=$(curl -s $IP_FLAG -H "User-Agent: $USER_AGENT" -H "Authorization: $SESSION_TOKEN" "$BASE_URL/getDownloadUrl")
-    local dl_url=$(get_json_value "$resp" "downloadUrl")
-    
-    # 使用 grep 提取 token，兼容性更好
-    DOWNLOAD_TOKEN=$(echo "$dl_url" | grep -o "token=[^&]*" | cut -d= -f2)
-    if [ -z "$DOWNLOAD_TOKEN" ]; then DOWNLOAD_TOKEN="aaa"; fi
+    # 尝试解析动态 Token
+    local resp=$(curl $IP_FLAG $CURL_FLAGS -H "User-Agent: $USER_AGENT" -H "Authorization: $SESSION_TOKEN" "$BASE_URL/getDownloadUrl")
+    local api_dl_url=$(get_json_value "$resp" "downloadUrl")
+    local extracted_token=$(echo "$api_dl_url" | sed -n 's/.*token=\([^&]*\).*/\1/p')
+    if [ -n "$extracted_token" ]; then TOKEN_VAL="$extracted_token"; fi
 
-    > /tmp/189_nodes.txt
-    
-    probe_single() {
+    rm -f "$WORKDIR/nodes.raw"
+
+    # 定义单个节点的探测逻辑
+    probe_single_node() {
         local i=$1
         local host="speedtp${i}.sc.189.cn"
-        local url="https://${host}:8299/download/1000.data?token=${DOWNLOAD_TOKEN}"
-        local latency=$(curl $IP_FLAG -s -o /dev/null -I -w "%{time_connect}" --connect-timeout 1.5 "$url")
+        local dl_url="https://${host}:8299/download/1000.data?token=${TOKEN_VAL}"
+        local up_url="https://${host}:8299/Upload"
+        
+        # 优化探测逻辑:
+        # 1. 使用 $CURL_FLAGS (-k -s)
+        # 2. 弃用 -I (HEAD)，改为 GET 并使用 -r 0-2048 (Range) 请求前 2KB 数据
+        #    避免部分节点不支持 HEAD 导致探测失败或延迟虚高
+        # 3. -w "%{time_connect}" 仅获取 TCP 握手时间 (纯延迟)，不包含数据传输时间
+        #    这能更真实地反映节点物理延迟，而不受下载速度/服务器处理时间影响
+        local latency=$(curl $IP_FLAG $CURL_FLAGS -o /dev/null -r 0-2048 -w "%{time_connect}" "$dl_url")
         
         if [ $? -eq 0 ] && [ "$latency" != "0.000000" ]; then
             local ms=$(awk "BEGIN {printf \"%.0f\", $latency * 1000}")
-            echo "$ms $url https://${host}:8299/Upload speedtp$i" >> /tmp/189_nodes.txt
+            # 输出格式: 延迟 下载地址 上传地址 节点名称
+            echo "$ms $dl_url $up_url speedtp$i" >> "$WORKDIR/nodes.raw"
         fi
     }
 
+    # 并发探测所有预设节点 (1-22)
     for i in {1..22}; do
-        probe_single $i &
+        probe_single_node $i &
     done
-    
     spinner $!
     wait
 
-    if [ ! -s /tmp/189_nodes.txt ]; then
-        log "未探测到可用节点，请检查网络。" "$RED"
+    # 检查探测结果
+    if [ ! -s "$WORKDIR/nodes.raw" ]; then
+        local mode_str=${IP_FLAG:-"Auto"}
+        log "错误: 未探测到任何可用节点。请检查网络连接或协议栈设置 (当前模式: $mode_str)。" "$RED"
         exit 1
     fi
 
-    sort -n /tmp/189_nodes.txt -o /tmp/189_nodes.sorted
+    # 对结果按延迟进行排序 (数值升序)
+    sort -n "$WORKDIR/nodes.raw" > "$WORKDIR/nodes.sorted"
 }
 
-# 4. 选择节点
+# 优选节点
 select_nodes() {
     BEST_DL_URLS=()
     BEST_UP_URLS=()
-
-    mapfile -t ALL_NODES < /tmp/189_nodes.sorted
+    SELECTED_INFOS=()
+    ALL_NODES=()
+    
+    # 使用 while read 循环读取，提高兼容性
+    if [ -f "$WORKDIR/nodes.sorted" ]; then
+        while IFS= read -r line; do
+            ALL_NODES+=("$line")
+        done < "$WORKDIR/nodes.sorted"
+    else
+        log "错误: 节点列表文件丢失。" "$RED"
+        exit 1
+    fi
 
     if [[ "$SELECT_NODES" == "true" ]]; then
         echo -e "\n${CYAN}=== 可用节点列表 ===${NC}"
         local idx=1
         for line in "${ALL_NODES[@]}"; do
             read -r ms dl up name <<< "$line"
-            echo -e "[${idx}] ${GREEN}${ms}ms${NC}\t${name}\t(${dl})"
+            echo -e "[${idx}] ${GREEN}${ms}ms${NC}\t${name}"
             ((idx++))
         done
-        
-        echo -e "\n请输入要使用的节点序号 (例如 1,3)，输入 all 全选，直接回车默认前3个:"
-        read -r user_input
-        
-        if [[ "$user_input" == "all" ]]; then
-             for line in "${ALL_NODES[@]}"; do
+        echo -e "\n请输入节点序号 (如 1,3)，输入 'all' 全选，直接回车默认选择前3个:"
+        read -r input
+        if [[ "$input" == "all" ]]; then
+            for line in "${ALL_NODES[@]}"; do
                 read -r ms dl up name <<< "$line"
                 BEST_DL_URLS+=("$dl")
                 BEST_UP_URLS+=("$up")
+                SELECTED_INFOS+=("${name}(${ms}ms)")
             done
-        elif [[ -n "$user_input" ]]; then
-            IFS=',' read -ra ADDR <<< "$user_input"
-            for i in "${ADDR[@]}"; do
+        elif [[ -n "$input" ]]; then
+            IFS=',' read -ra IDX <<< "$input"
+            for i in "${IDX[@]}"; do
                 local line="${ALL_NODES[$((i-1))]}"
                 if [[ -n "$line" ]]; then
                     read -r ms dl up name <<< "$line"
                     BEST_DL_URLS+=("$dl")
                     BEST_UP_URLS+=("$up")
+                    SELECTED_INFOS+=("${name}(${ms}ms)")
                 fi
             done
         fi
     fi
 
+    # 若未手动选择，默认自动优选前3个低延迟节点
     if [ ${#BEST_DL_URLS[@]} -eq 0 ]; then
         local count=0
         for line in "${ALL_NODES[@]}"; do
             read -r ms dl up name <<< "$line"
             BEST_DL_URLS+=("$dl")
             BEST_UP_URLS+=("$up")
+            SELECTED_INFOS+=("${name} [${ms}ms]")
             ((count++))
             if [ $count -ge 3 ]; then break; fi
         done
-        log "已自动优选 ${#BEST_DL_URLS[@]} 个低延迟节点" "$GREEN"
-    else
-        log "已手动选择 ${#BEST_DL_URLS[@]} 个节点" "$GREEN"
     fi
+    
+    echo -e "\n${CYAN}=== 已优选测速节点 ===${NC}"
+    for info in "${SELECTED_INFOS[@]}"; do
+        echo -e " -> ${GREEN}$info${NC}"
+    done
+    echo ""
 }
 
-# 5. 执行测速
+# 执行测速任务
 run_test() {
     local type=$1
     local title=$2
-    local urls=("${!3}")
-    local tmp_dir=$(mktemp -d)
+    # 使用引用传递数组变量名
+    local -n urls_ref=$3 
+    local urls_count=${#urls_ref[@]}
     
-    log "开始${title}测试 (时长: ${DURATION}s, 线程: ${THREADS})..." "$CYAN"
-    
-    if [ "$type" == "up" ]; then
-        dd if=/dev/urandom of="$tmp_dir/upload.dat" bs=1M count=64 status=none
+    if [ "$urls_count" -eq 0 ]; then
+        log "错误: 未选定有效的测速节点。" "$RED"
+        exit 1
     fi
 
-    local pids=""
-    local start_time=$(date +%s.%N)
+    local test_dir="$WORKDIR/test_$type"
+    mkdir -p "$test_dir"
     
+    # 生成上传测试数据 (仅生成一次并复用)
+    local upload_file="$WORKDIR/upload.bin"
+    if [ "$type" == "up" ] && [ ! -f "$upload_file" ]; then
+        # 生成 512KB 的随机数据文件
+        dd if=/dev/urandom of="$upload_file" bs=1k count=512 2>/dev/null
+    fi
+
+    log "开始${title}测试 (时长: ${DURATION}s, 线程: ${THREADS})..." "$CYAN"
+    
+    local pids=""
+    local start_time=$(date +%s)
+    local end_time_global=$((start_time + DURATION))
+
     for ((i=0; i<THREADS; i++)); do
-        local node_idx=$((i % ${#urls[@]}))
-        local url="${urls[$node_idx]}"
+        local idx=$((i % urls_count))
+        local url="${urls_ref[$idx]}"
         
         (
             local thread_bytes=0
-            local end_time=$(awk "BEGIN {print $(date +%s) + $DURATION}")
             
-            while [ $(date +%s) -lt $end_time ]; do
-                local current_time=$(date +%s)
-                local remain=$((end_time - current_time))
-                if [ $remain -le 0 ]; then break; fi
+            while [ $(date +%s) -lt $end_time_global ]; do
+                local now=$(date +%s)
+                local remain=$((end_time_global - now))
+                [ $remain -le 0 ] && break
                 
-                local r=$RANDOM
-                
+                # 应用全局 CURL_FLAGS
                 if [ "$type" == "down" ]; then
-                    local bytes=$(curl $IP_FLAG -k -s -o /dev/null -w "%{size_download}" \
-                        --max-time $remain \
-                        -H "User-Agent: $USER_AGENT" \
-                        -H "Referer: $REFERER" \
-                        "$url")
-                    thread_bytes=$((thread_bytes + bytes))
+                    local b=$(curl $IP_FLAG $CURL_FLAGS -o /dev/null -w "%{size_download}" --max-time $remain "$url")
+                    thread_bytes=$((thread_bytes + b))
                 else
-                    # POST 上传修复
-                    local target_url="${url}?r=${r}"
-                    local bytes=$(curl $IP_FLAG -k -s -o /dev/null -w "%{size_upload}" \
-                        --max-time $remain \
-                        -X POST \
-                        -H "User-Agent: $USER_AGENT" \
-                        -H "Referer: $REFERER" \
-                        -H "Content-Type: application/octet-stream" \
-                        --data-binary @"$tmp_dir/upload.dat" \
-                        "$target_url")
-                    thread_bytes=$((thread_bytes + bytes))
+                    # 上传测试: 添加随机参数防止服务端缓存
+                    local target="${url}?r=$RANDOM"
+                    # 使用 --data-binary 发送二进制数据
+                    local b=$(curl $IP_FLAG $CURL_FLAGS -o /dev/null -w "%{size_upload}" --max-time $remain \
+                        -X POST -H "Content-Type: application/octet-stream" \
+                        --data-binary @"$upload_file" "$target")
+                    thread_bytes=$((thread_bytes + b))
                 fi
             done
-            echo $thread_bytes > "$tmp_dir/thread_${i}.res"
+            # 将线程结果写入独立文件，避免竞争
+            echo $thread_bytes > "$test_dir/$i.res"
         ) &
         pids="$pids $!"
     done
@@ -335,41 +414,45 @@ run_test() {
     spinner $!
     wait $pids
     
-    local end_time=$(date +%s.%N)
-    local actual_duration=$(awk "BEGIN {print $end_time - $start_time}")
+    local real_end_time=$(date +%s)
+    local diff=$((real_end_time - start_time))
+    [ $diff -eq 0 ] && diff=1 
     
-    local total_bytes=0
-    for f in "$tmp_dir"/*.res; do
+    local total=0
+    # 汇总所有线程的吞吐量
+    for f in "$test_dir"/*.res; do
         if [ -f "$f" ]; then
-            local b=$(cat "$f")
-            total_bytes=$((total_bytes + b))
+            val=$(cat "$f")
+            total=$((total + val))
         fi
     done
     
-    local speed_mbps=$(awk "BEGIN {printf \"%.2f\", ($total_bytes * 8) / (1024 * 1024) / $actual_duration}")
-    
-    log "${title}结果: ${speed_mbps} Mbps" "$GREEN"
-    rm -rf "$tmp_dir"
+    # 计算速率: (Total Bytes * 8) / 1024 / 1024 / Time
+    local mbps=$(awk "BEGIN {printf \"%.2f\", ($total * 8) / 1048576 / $diff}")
+    log "${title}结果: ${mbps} Mbps" "$GREEN"
 }
 
-# --- 主逻辑路由 ---
+# --- 主程序入口 ---
 
 check_deps
 
+# 处理 'info' 命令
 if [[ "$COMMAND" == "info" ]]; then
     authenticate || exit 1
     get_user_info
     exit 0
 fi
 
+# 处理 'nodes' 命令
 if [[ "$COMMAND" == "nodes" ]]; then
     authenticate || exit 1
     probe_nodes
     echo -e "\n${CYAN}可用节点列表:${NC}"
-    cat /tmp/189_nodes.sorted | awk '{print "延迟: " $1 "ms  \tID: " $4 "\t地址: " $2}'
+    awk '{print "延迟: " $1 "ms  \t地址: " $2}' "$WORKDIR/nodes.sorted"
     exit 0
 fi
 
+# 处理 'test' 命令 (默认)
 if [[ "$COMMAND" == "test" ]]; then
     authenticate || exit 1
     get_user_info
@@ -377,15 +460,17 @@ if [[ "$COMMAND" == "test" ]]; then
     select_nodes
     
     if [[ "$MODE" == "all" || "$MODE" == "down" ]]; then
-        run_test "down" "下载" BEST_DL_URLS[@]
-    fi
-
-    if [[ "$MODE" == "all" || "$MODE" == "up" ]]; then
-        run_test "up" "上传" BEST_UP_URLS[@]
+        run_test "down" "下载" BEST_DL_URLS
     fi
     
-    echo "测速完成。"
+    # 任务间隔，缓解网络压力
+    if [[ "$MODE" == "all" ]]; then
+        sleep 1
+    fi
+    
+    if [[ "$MODE" == "all" || "$MODE" == "up" ]]; then
+        run_test "up" "上传" BEST_UP_URLS
+    fi
+    echo "测速任务完成。"
     exit 0
 fi
-
-usage
