@@ -2,7 +2,7 @@
 """
 189电信宽带测速工具
 Author: foxxorcat
-Version: 1.2.0
+Version: 1.3.0
 Description:
 """
 
@@ -13,7 +13,7 @@ import threading
 import argparse
 import sys
 import socket
-from datetime import datetime
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib3
 
@@ -32,15 +32,18 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class SocketPatcher:
     """
-    网络协议栈补丁管理器
+    网络协议栈补丁管理器 (全局单例模式)
     
     功能:
         通过 Hook socket.getaddrinfo 方法，强制 Python 网络层只使用 IPv4 或 IPv6 协议栈。
-        用于在双栈网络环境下强制测试特定协议的连通性和速度。
+    注意:
+        socket.getaddrinfo 是全局的，必须在主线程或并发控制外层进行 Hook，
+        严禁在多线程内部独立 Hook/Unhook，否则会产生竞争条件。
     """
     def __init__(self, mode):
         self.mode = mode.lower()
         self.original_getaddrinfo = socket.getaddrinfo
+        self._patched = False
 
     def __enter__(self):
         if self.mode not in ['ipv4', 'ipv6']:
@@ -54,17 +57,22 @@ class SocketPatcher:
                 res = self.original_getaddrinfo(*args, **kwargs)
                 # 过滤出符合目标协议族的地址
                 filtered = [r for r in res if r[0] == target_family]
+                if not filtered and res: 
+                    # 如果过滤后为空但原结果不为空（说明没有对应协议栈的IP），抛出异常让requests重试或报错
+                    raise socket.gaierror("No address found for forced protocol family")
                 return filtered
             except Exception:
-                return []
+                # 兼容处理
+                return self.original_getaddrinfo(*args, **kwargs)
         
         socket.getaddrinfo = patched_getaddrinfo
+        self._patched = True
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.mode not in ['ipv4', 'ipv6']:
-            return
-        # 恢复原始 socket 方法
-        socket.getaddrinfo = self.original_getaddrinfo
+        if self._patched:
+            # 恢复原始 socket 方法
+            socket.getaddrinfo = self.original_getaddrinfo
+            self._patched = False
 
 class TelecomSpeedTester:
     """
@@ -126,30 +134,45 @@ class TelecomSpeedTester:
         """
         探测当前网络环境的公网 IP 地址 (IPv4/IPv6)
         """
-        def parse_ip_resp(resp):
-            if not resp.text.strip(): return None
+        def parse_ip_resp(resp, ip_type='v4'):
+            content = resp.text.strip()
+            if not content: return None
+            
+            # 1. 尝试 JSON 解析
             try:
                 data = resp.json()
-                return data.get("IP")
-            except:
-                return resp.text.strip()
+                if data.get("IP"): return data.get("IP")
+            except: pass
+            
+            # 2. 正则兜底解析 (修复Bug: 避免返回HTML或脏数据)
+            if ip_type == 'v6':
+                match = re.search(r'([a-fA-F0-9]{1,4}:){1,7}[a-fA-F0-9]{1,4}', content)
+            else:
+                match = re.search(r'[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}', content)
+                
+            if match:
+                return match.group(0)
+            
+            return content # 最后的兜底
 
         # 检测 IPv4
         try:
             resp4 = requests.get('https://speedtp3.sc.189.cn:8299/ip/ipv4', timeout=3, verify=False)
-            self.ipv4_addr = parse_ip_resp(resp4) if resp4.status_code == 200 else "检测失败"
+            self.ipv4_addr = parse_ip_resp(resp4, 'v4') if resp4.status_code == 200 else "检测失败"
         except: self.ipv4_addr = "检测异常"
 
         # 检测 IPv6
         try:
             resp6 = requests.get('https://speedtp3.sc.189.cn:8299/ip/ipv6', timeout=3, verify=False)
-            self.ipv6_addr = parse_ip_resp(resp6) if resp6.status_code == 200 else "不支持/未连接"
+            self.ipv6_addr = parse_ip_resp(resp6, 'v6') if resp6.status_code == 200 else "不支持/未连接"
         except: self.ipv6_addr = "不支持/未连接"
 
     def authenticate(self):
         """
         执行 API 鉴权流程，获取 Session Token
         """
+        # 注意：鉴权请求建议走默认路由，不强制 IP 模式，以免管理接口不支持 IPv6 导致鉴权失败
+        # 这里不使用 SocketPatcher
         url = f"{self.base_url}/getOnlineIP"
         try:
             resp = requests.get(url, headers=self.headers, timeout=5)
@@ -182,7 +205,6 @@ class TelecomSpeedTester:
         self.available_nodes = {'download': [], 'upload': []}
         
         # 1. 获取官方配置的节点列表
-        # 注意: 此处 API 调用使用默认网络栈，避免因强制 IPv6 导致管理接口无法访问
         url = f"{self.base_url}/getDownloadUrl"
         api_nodes_down, api_nodes_up = [], []
         
@@ -214,15 +236,18 @@ class TelecomSpeedTester:
         def probe(url, type_):
             t_start = time.time()
             try:
-                # 探测请求受 SocketPatcher 影响，验证指定协议栈的连通性
+                # 优化: 增加 Range 头，模拟 Shell 脚本行为，减少下载量
+                headers = {'Range': 'bytes=0-2048'} if type_ == 'down' else {}
+                
                 if type_ == 'down':
-                    r = requests.get(url, stream=True, timeout=2, verify=False)
+                    # 使用 stream=True 且读取极少量内容来触发 TCP/SSL 握手
+                    r = requests.get(url, headers=headers, stream=True, timeout=2, verify=False)
                     r.close()
                 else:
                     r = requests.post(url, data=b'', timeout=2, verify=False)
                 
                 latency = (time.time() - t_start) * 1000 # ms
-                if r.status_code in [200, 204]:
+                if r.status_code in [200, 204, 206]: # 206 Partial Content
                     node_id = "?"
                     if 'speedtp' in url:
                         node_id = url.split('speedtp')[1].split('.')[0]
@@ -234,7 +259,7 @@ class TelecomSpeedTester:
             except: pass
             return None
 
-        # 4. 执行并发探测
+        # 4. 执行并发探测 (在外层应用补丁)
         def run_probe():
             with SocketPatcher(self.ip_mode):
                 with ThreadPoolExecutor(max_workers=24) as executor:
@@ -392,59 +417,78 @@ class TelecomSpeedTester:
 
         def worker():
             nonlocal total_bytes
-            # 在线程内应用协议补丁，确保并发请求也遵循 IP 模式
-            with SocketPatcher(self.ip_mode):
-                while not stop_event.is_set():
-                    url = random.choice(urls)
-                    try:
-                        if test_type == 'download':
-                            with requests.get(url, stream=True, timeout=5, verify=False) as r:
-                                for chunk in r.iter_content(chunk_size=65536):
-                                    if stop_event.is_set(): break
-                                    if chunk:
-                                        with lock: total_bytes += len(chunk)
-                        else:
-                            # 上传: 使用 POST 发送二进制数据
-                            target_url = url
-                            # 添加随机参数防止缓存
-                            sep = '&' if '?' in target_url else '?'
-                            target_url += f"{sep}r={random.random()}"
-                            
-                            requests.post(target_url, data=upload_raw_data, timeout=10, verify=False)
-                            with lock: total_bytes += len(upload_raw_data)
-                    except: 
-                        time.sleep(0.5)
+            # 移除线程内部的 SocketPatcher，避免多线程环境下的 Hook 竞争冲突
+            # Hook 已经在 run_test 外层统一处理
+            while not stop_event.is_set():
+                url = random.choice(urls)
+                try:
+                    if test_type == 'download':
+                        with requests.get(url, stream=True, timeout=5, verify=False) as r:
+                            for chunk in r.iter_content(chunk_size=65536):
+                                if stop_event.is_set(): break
+                                if chunk:
+                                    with lock: total_bytes += len(chunk)
+                    else:
+                        # 上传: 使用 POST 发送二进制数据
+                        target_url = url
+                        # 添加随机参数防止缓存
+                        sep = '&' if '?' in target_url else '?'
+                        target_url += f"{sep}r={random.random()}"
+                        
+                        requests.post(target_url, data=upload_raw_data, timeout=10, verify=False)
+                        with lock: total_bytes += len(upload_raw_data)
+                except: 
+                    time.sleep(0.5)
 
-        with ThreadPoolExecutor(max_workers=threads) as executor:
-            for _ in range(threads): executor.submit(worker)
-            
-            start_time = time.time()
-            title = "Download" if test_type == 'download' else "Upload"
-            color = "green" if test_type == 'download' else "blue"
-            
-            last_sample_time = start_time
-            last_sample_bytes = 0
+        # 在启动线程池之前，统一进行 Socket Hook，确保所有线程都继承相同的协议栈设置
+        with SocketPatcher(self.ip_mode):
+            with ThreadPoolExecutor(max_workers=threads) as executor:
+                for _ in range(threads): executor.submit(worker)
+                
+                start_time = time.time()
+                title = "Download" if test_type == 'download' else "Upload"
+                color = "green" if test_type == 'download' else "blue"
+                
+                last_sample_time = start_time
+                last_sample_bytes = 0
 
-            try:
-                # 进度条显示与采样循环
-                if self.console:
-                    with Progress(
-                        SpinnerColumn(),
-                        TextColumn(f"[{color}]{{task.description}}"),
-                        BarColumn(),
-                        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-                        TimeRemainingColumn(),
-                        TextColumn(f"[{color}]Rate: {{task.fields[speed]}}"),
-                        console=self.console,
-                        transient=False
-                    ) as progress:
-                        task = progress.add_task(title, total=duration, speed="0.00")
+                try:
+                    # 进度条显示与采样循环
+                    if self.console:
+                        with Progress(
+                            SpinnerColumn(),
+                            TextColumn(f"[{color}]{{task.description}}"),
+                            BarColumn(),
+                            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                            TimeRemainingColumn(),
+                            TextColumn(f"[{color}]Rate: {{task.fields[speed]}}"),
+                            console=self.console,
+                            transient=False
+                        ) as progress:
+                            task = progress.add_task(title, total=duration, speed="0.00")
+                            while not stop_event.is_set():
+                                now = time.time()
+                                elapsed = now - start_time
+                                if elapsed >= duration: break
+                                
+                                # 采样瞬时速度 (每0.5秒)
+                                dt = now - last_sample_time
+                                if dt >= 0.5:
+                                    d_bytes = total_bytes - last_sample_bytes
+                                    inst_bps = (d_bytes * 8) / dt
+                                    speed_samples.append(inst_bps)
+                                    last_sample_time = now
+                                    last_sample_bytes = total_bytes
+                                
+                                # 计算累计平均速度用于 UI 显示 (这里仍显示总平均，包含启动时间，避免UI跳变)
+                                avg_display = (total_bytes * 8) / elapsed if elapsed > 0 else 0
+                                progress.update(task, completed=elapsed, speed=self._format_speed(avg_display))
+                                time.sleep(0.1)
+                    else:
                         while not stop_event.is_set():
                             now = time.time()
-                            elapsed = now - start_time
-                            if elapsed >= duration: break
+                            if now - start_time >= duration: break
                             
-                            # 采样瞬时速度 (每0.5秒)
                             dt = now - last_sample_time
                             if dt >= 0.5:
                                 d_bytes = total_bytes - last_sample_bytes
@@ -452,27 +496,10 @@ class TelecomSpeedTester:
                                 speed_samples.append(inst_bps)
                                 last_sample_time = now
                                 last_sample_bytes = total_bytes
-                            
-                            # 计算累计平均速度用于 UI 显示 (这里仍显示总平均，包含启动时间，避免UI跳变)
-                            avg_display = (total_bytes * 8) / elapsed if elapsed > 0 else 0
-                            progress.update(task, completed=elapsed, speed=self._format_speed(avg_display))
                             time.sleep(0.1)
-                else:
-                    while not stop_event.is_set():
-                        now = time.time()
-                        if now - start_time >= duration: break
-                        
-                        dt = now - last_sample_time
-                        if dt >= 0.5:
-                            d_bytes = total_bytes - last_sample_bytes
-                            inst_bps = (d_bytes * 8) / dt
-                            speed_samples.append(inst_bps)
-                            last_sample_time = now
-                            last_sample_bytes = total_bytes
-                        time.sleep(0.1)
 
-            finally:
-                stop_event.set()
+                finally:
+                    stop_event.set()
 
         # 统计 Min/Max/Avg
         if not speed_samples:
@@ -627,8 +654,10 @@ def main():
     parser = argparse.ArgumentParser(description="China Telecom (189) Speed Test Tool")
     subparsers = parser.add_subparsers(dest="command", help="可用命令")
     
-    # 通用参数
+    # 通用/全局参数 (支持 -4/-6)
     parser.add_argument("--ip", choices=['auto', 'ipv4', 'ipv6'], default='auto', help="强制使用 IPv4 或 IPv6 协议栈")
+    parser.add_argument("-4", dest="ip_short_4", action="store_true", help="强制 IPv4 (等同于 --ip ipv4)")
+    parser.add_argument("-6", dest="ip_short_6", action="store_true", help="强制 IPv6 (等同于 --ip ipv6)")
 
     # 子命令: test
     p_test = subparsers.add_parser("test", help="开始测速")
@@ -638,16 +667,23 @@ def main():
     p_test.add_argument("--unit", choices=['Mbps', 'MB/s'], default='Mbps', help="显示单位")
     p_test.add_argument("--simple", action="store_true", help="脚本模式 (仅输出数字)")
     p_test.add_argument("--select", action="store_true", help="交互式选择测速节点")
+    # 子命令也支持 IP 参数
     p_test.add_argument("--ip", choices=['auto', 'ipv4', 'ipv6'], default='auto', help="强制协议栈")
+    p_test.add_argument("-4", dest="ip_short_4", action="store_true", help="强制 IPv4")
+    p_test.add_argument("-6", dest="ip_short_6", action="store_true", help="强制 IPv6")
     
     # 子命令: info
     p_info = subparsers.add_parser("info", help="显示宽带信息")
     p_info.add_argument("--simple", action="store_true", help="脚本模式")
+    p_info.add_argument("-4", dest="ip_short_4", action="store_true", help="强制 IPv4")
+    p_info.add_argument("-6", dest="ip_short_6", action="store_true", help="强制 IPv6")
     
     # 子命令: nodes
     p_nodes = subparsers.add_parser("nodes", help="列出可用节点")
     p_nodes.add_argument("--simple", action="store_true", help="脚本模式")
     p_nodes.add_argument("--ip", choices=['auto', 'ipv4', 'ipv6'], default='auto', help="强制协议栈")
+    p_nodes.add_argument("-4", dest="ip_short_4", action="store_true", help="强制 IPv4")
+    p_nodes.add_argument("-6", dest="ip_short_6", action="store_true", help="强制 IPv6")
 
     args = parser.parse_args()
     
@@ -657,8 +693,15 @@ def main():
     
     # 实例化测试器
     is_simple = getattr(args, 'simple', False)
-    # 获取IP模式 (子命令参数优先)
-    ip_mode = getattr(args, 'ip', 'auto')
+    
+    # 解析 IP 模式：短参数优先 -> 子命令长参数 -> 全局长参数
+    ip_mode = 'auto'
+    if getattr(args, 'ip_short_6', False):
+        ip_mode = 'ipv6'
+    elif getattr(args, 'ip_short_4', False):
+        ip_mode = 'ipv4'
+    elif getattr(args, 'ip', 'auto') != 'auto':
+        ip_mode = args.ip
     
     tester = TelecomSpeedTester(verbose=not is_simple, simple_mode=is_simple, ip_mode=ip_mode)
 
