@@ -7,9 +7,9 @@
 1. **下载脚本**
 
    ```bash
-   curl -O [https://raw.githubusercontent.com/foxxorcat/speed-sc-189/main/speed_sc_189.sh](https://raw.githubusercontent.com/foxxorcat/speed-sc-189/main/speed_sc_189.sh)
+   curl -O https://raw.githubusercontent.com/foxxorcat/speed-sc-189/main/speed_sc_189.sh
    # 或者
-   wget [https://raw.githubusercontent.com/foxxorcat/speed-sc-189/main/speed_sc_189.sh](https://raw.githubusercontent.com/foxxorcat/speed-sc-189/main/speed_sc_189.sh)
+   wget https://raw.githubusercontent.com/foxxorcat/speed-sc-189/main/speed_sc_189.sh
    ```
 
 2. **赋予执行权限**
